@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 use std::{
     io::{BufRead, StdoutLock, Write},
     sync::mpsc,
@@ -15,7 +16,7 @@ pub struct Message<Payload> {
     pub body: Body<Payload>,
 }
 
-impl<Payload> Message<Payload> {
+impl<Payload: Debug> Message<Payload> {
     pub fn to_reply(self, msg_id: Option<&mut usize>) -> Self {
         Self {
             src: self.dst,
@@ -76,7 +77,7 @@ pub trait Node<S, Payload> {
 pub fn main_loop<S, N, P>(init_state: S) -> anyhow::Result<()>
 where
     N: Node<S, P> + Send,
-    P: DeserializeOwned + Send + 'static,
+    P: DeserializeOwned + Send + 'static + Debug,
 {
     let stdin = std::io::stdin().lock();
     let mut stdin = stdin.lines();
@@ -114,9 +115,12 @@ where
         let stdin = std::io::stdin().lock();
         for line in stdin.lines() {
             let line = line.expect("error reading next line from stdin");
+            // println!("input received: {:?}", line);
             let input: Message<P> = serde_json::from_str(&line)
                 .context("input could not be deserialized")
                 .unwrap();
+
+            // println!("input received: {:?}", &input);
             if let Err(e) = tx_std.send(input) {
                 eprintln!("error sending input to tx: {e:?}");
             }
