@@ -1,3 +1,4 @@
+use glob::glob;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{BufReader, Write, prelude::*};
@@ -47,6 +48,7 @@ struct FileHandle {
 
 struct KafkaNode {
     id: String,
+    node_ids: Vec<String>,
     msg_id_seq: usize,
 
     // keys in fly-io kafka workload
@@ -72,7 +74,7 @@ impl KafkaNode {
             // Open for read/write; create if missing
             let w = OpenOptions::new()
                 .create(true)
-                .write(true)
+                .append(true)
                 .open(&path)
                 .context("open, append only write log file")?;
             let r = OpenOptions::new()
@@ -81,8 +83,11 @@ impl KafkaNode {
                 .context("open, read only log")?;
 
             // Seek once to the end to initialize the next offset
-            self.next_offsets
-                .insert(topic.to_string(), AtomicUsize::new(0));
+            if !self.next_offsets.contains_key(topic) {
+                self.next_offsets
+                    .insert(topic.to_string(), AtomicUsize::new(0));
+            }
+
             self.file_handles
                 .insert(topic.to_string(), FileHandle { r, w });
         }
@@ -90,6 +95,68 @@ impl KafkaNode {
             self.file_handles.get_mut(topic).unwrap(),
             self.next_offsets.get_mut(topic).unwrap(),
         ))
+    }
+
+    fn build_index(
+        node_id: &str,
+    ) -> anyhow::Result<(
+        HashMap<String, HashMap<usize, u64>>,
+        HashMap<String, AtomicUsize>,
+    )> {
+        let pattern = format!("{}-*.log", node_id);
+
+        let mut index: HashMap<String, HashMap<usize, u64>> = HashMap::new();
+        let mut next_offsets = HashMap::new();
+
+        for path_entry in glob(&pattern).expect("invalid glob pattern") {
+            match path_entry {
+                Ok(path) => {
+                    if path.is_file() {
+                        let readf = File::open(&path).context("build index, read file")?;
+                        let mut reader = BufReader::new(readf);
+
+                        // too much confidence in directory structures
+                        let stem = path.file_stem().unwrap().to_str().unwrap();
+                        let topic = stem.strip_prefix(&format!("{}-", node_id)).unwrap();
+                        let mut location_ptr = 0u64;
+                        let mut buf = String::new();
+                        let mut next_offset = 0;
+                        loop {
+                            buf.clear();
+                            let n = reader.read_line(&mut buf)?;
+                            if n == 0 {
+                                break;
+                            }
+                            let log_entry: LogEntry = serde_json::from_str(buf.trim_end())?;
+                            if log_entry.offset > next_offset {
+                                next_offset = log_entry.offset;
+                            }
+
+                            index
+                                .entry(topic.to_string())
+                                .or_default()
+                                .insert(log_entry.offset, location_ptr);
+                            location_ptr += n as u64;
+                        }
+                        next_offsets.insert(topic.to_string(), AtomicUsize::new(next_offset + 1));
+                    }
+                }
+                Err(e) => eprintln!("glob error: {}", e),
+            }
+        }
+        Ok((index, next_offsets))
+    }
+
+    fn update_index(&mut self, topic: &str, current_offset: usize, file_loc_ptr: u64) {
+        if let Some(entry) = self.index.get_mut(topic) {
+            entry.insert(current_offset, file_loc_ptr);
+        } else {
+            self.index.insert(topic.to_string(), HashMap::new());
+            let Some(entry) = self.index.get_mut(topic) else {
+                panic!("unreachable");
+            };
+            entry.insert(current_offset, file_loc_ptr);
+        }
     }
 
     fn append_message(&mut self, topic: &str, message: usize) -> anyhow::Result<usize> {
@@ -113,15 +180,7 @@ impl KafkaNode {
         file.write_all(&buf).context("write log entry to file")?;
 
         // update the index with start ptr of current message.
-        if let Some(entry) = self.index.get_mut(topic) {
-            entry.insert(current_offset, start_ptr);
-        } else {
-            self.index.insert(topic.to_string(), HashMap::new());
-            let Some(entry) = self.index.get_mut(topic) else {
-                panic!("unreachable");
-            };
-            entry.insert(current_offset, start_ptr);
-        }
+        self.update_index(topic, current_offset, start_ptr);
         Ok(current_offset)
     }
 
@@ -212,14 +271,18 @@ impl Node<(), Payload> for KafkaNode {
     where
         Self: Sized,
     {
-        Ok(Self {
+        let mut new = Self {
             id: init.node_id,
             msg_id_seq: 1,
             topics: vec![],
             next_offsets: HashMap::new(),
             file_handles: HashMap::new(),
             index: HashMap::new(),
-        })
+            node_ids: init.node_ids,
+        };
+        (new.index, new.next_offsets) = Self::build_index(&new.id).context("building index")?;
+
+        Ok(new)
     }
 
     fn step(
