@@ -1,4 +1,6 @@
 use glob::glob;
+use log;
+use simplelog::*;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{BufReader, Write, prelude::*};
@@ -43,7 +45,7 @@ enum Payload {
 #[derive(Debug)]
 struct FileHandle {
     r: File,
-    w: File,
+    w: std::io::BufWriter<File>,
 }
 
 struct KafkaNode {
@@ -88,8 +90,13 @@ impl KafkaNode {
                     .insert(topic.to_string(), AtomicUsize::new(0));
             }
 
-            self.file_handles
-                .insert(topic.to_string(), FileHandle { r, w });
+            self.file_handles.insert(
+                topic.to_string(),
+                FileHandle {
+                    r,
+                    w: std::io::BufWriter::new(w),
+                },
+            );
         }
         Ok((
             self.file_handles.get_mut(topic).unwrap(),
@@ -163,21 +170,17 @@ impl KafkaNode {
         let (fh, offset) = self
             .get_or_create_log_file(topic)
             .context("open/seek file")?;
-        let mut file = &fh.w;
         let current_offset = *offset.get_mut();
         let entry = LogEntry {
             offset: current_offset,
             message,
         };
-        let mut buf = Vec::new();
         let start_ptr = fh.r.metadata()?.len();
-        serde_json::to_writer(&mut buf, &entry).context("serialize entry")?;
-        buf.push(b'\n');
 
         *offset.get_mut() += 1; // increment the atomic counter of msg offsets
         // this will append we can we have opened the file in append mode.
 
-        file.write_all(&buf).context("write log entry to file")?;
+        writeln!(fh.w, "{}", serde_json::to_string(&entry)?)?;
 
         // update the index with start ptr of current message.
         self.update_index(topic, current_offset, start_ptr);
@@ -200,6 +203,7 @@ impl KafkaNode {
         };
         let pos = *pos;
         let (fh, _) = self.get_or_create_log_file(topic)?;
+        fh.w.flush()?; // flushing before starting to read.
         let rf = &fh.r;
         let mut reader = BufReader::new(rf);
 
@@ -214,7 +218,7 @@ impl KafkaNode {
             }
             let entry: LogEntry = serde_json::from_str(&line)?;
             if !started {
-                if entry.offset == start_message_offset {
+                if entry.offset >= start_message_offset {
                     out.push(entry);
                 }
                 started = true;
@@ -280,7 +284,9 @@ impl Node<(), Payload> for KafkaNode {
             index: HashMap::new(),
             node_ids: init.node_ids,
         };
-        (new.index, new.next_offsets) = Self::build_index(&new.id).context("building index")?;
+        if let Ok(res) = Self::build_index(&new.id).context("building index") {
+            (new.index, new.next_offsets) = res;
+        }
 
         Ok(new)
     }
@@ -293,6 +299,7 @@ impl Node<(), Payload> for KafkaNode {
         let mut reply = input.to_reply(Some(&mut self.msg_id_seq));
         match reply.body.payload {
             Payload::Send { topic, message } => {
+                log::debug!("send received: key: {}, message: {}", topic, message);
                 let ofs = self.append_message(&topic, message)?;
                 reply.body.payload = Payload::SendOk { offset: ofs };
                 reply.send(writer).context("write to stdout, sendok")?;
@@ -302,6 +309,9 @@ impl Node<(), Payload> for KafkaNode {
                 for (topic, start_offset) in &offsets {
                     let v = self.read_messages(topic, *start_offset)?;
                     result.insert(topic.to_string(), v);
+                }
+                for (key, vals) in &result {
+                    log::debug!("poll ok: key: {}, vals: {:?}", key, vals);
                 }
                 reply.body.payload = Payload::PollOk { messages: result };
                 reply.send(writer).context("write to stdout, pollok")?;
@@ -337,6 +347,20 @@ impl Node<(), Payload> for KafkaNode {
 }
 
 fn main() -> anyhow::Result<()> {
+    let log_path = "/Users/shubham/code/kafka-test.log";
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .expect("Unable to open or create log file");
+    log::info!("-----starting the node-------------------");
+    CombinedLogger::init(vec![WriteLogger::new(
+        LevelFilter::Debug,
+        Config::default(),
+        log_file,
+    )])
+    .unwrap();
+
     main_loop::<(), KafkaNode, Payload>(())?;
     Ok(())
 }
